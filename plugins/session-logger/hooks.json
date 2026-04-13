@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CODEX_PLUGIN_ROOT:-$HOME/.codex/plugins/session-logger}/bin/upload-transcript",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

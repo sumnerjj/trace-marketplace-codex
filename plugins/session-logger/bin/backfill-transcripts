@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Bulk-uploads historical Codex session transcripts to Trace.
+# Safe to run multiple times — idempotent via upsert + state file.
+
+set -euo pipefail
+
+SESSIONS_DIR="${HOME}/.codex/sessions"
+STATE_DIR="${HOME}/.trace"
+STATE_FILE="${STATE_DIR}/backfill-state-codex"
+LOG_FILE="${STATE_DIR}/backfill-codex.log"
+USER_ID_FILE="${CODEX_PLUGIN_DATA:-${HOME}/.codex}/session-logger-user-id"
+
+MAX_TRANSCRIPT_BYTES=20971520
+
+ENDPOINT="${CODEX_PLUGIN_OPTION_api_endpoint:-https://coiuopsyykjkqxnqvaat.supabase.co}"
+API_KEY="${CODEX_PLUGIN_OPTION_api_token:-sb_publishable_dpIjwoECCU188xDCnaCWTg_v_ecvyP_}"
+
+mkdir -p "$STATE_DIR"
+touch "$STATE_FILE"
+
+log() {
+  echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG_FILE"
+}
+
+if [ ! -f "$USER_ID_FILE" ]; then
+  log "ERROR: no user_id at $USER_ID_FILE. Run a live session first."
+  exit 1
+fi
+USER_ID=$(cat "$USER_ID_FILE")
+
+if [ ! -d "$SESSIONS_DIR" ]; then
+  log "ERROR: no Codex sessions directory at $SESSIONS_DIR"
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+FILES_LIST=$(mktemp)
+trap 'rm -f "$FILES_LIST"' EXIT
+find "$SESSIONS_DIR" -type f -name "*.jsonl" > "$FILES_LIST"
+TOTAL=$(wc -l < "$FILES_LIST" | tr -d ' ')
+
+log "Backfill starting — found $TOTAL transcripts in $SESSIONS_DIR"
+
+COUNT=0; UPLOADED=0; SKIPPED_DONE=0; SKIPPED_EMPTY=0; SKIPPED_LARGE=0; FAILED=0
+
+while IFS= read -r TRANSCRIPT_PATH; do
+  COUNT=$((COUNT + 1))
+
+  if grep -Fxq "$TRANSCRIPT_PATH" "$STATE_FILE"; then
+    SKIPPED_DONE=$((SKIPPED_DONE + 1)); continue
+  fi
+
+  if [ ! -s "$TRANSCRIPT_PATH" ]; then
+    SKIPPED_EMPTY=$((SKIPPED_EMPTY + 1))
+    echo "$TRANSCRIPT_PATH" >> "$STATE_FILE"; continue
+  fi
+
+  SIZE=$(wc -c < "$TRANSCRIPT_PATH" | tr -d ' ')
+  if [ "$SIZE" -gt "$MAX_TRANSCRIPT_BYTES" ]; then
+    log "[$COUNT/$TOTAL] skip (too large: ${SIZE} bytes): $TRANSCRIPT_PATH"
+    SKIPPED_LARGE=$((SKIPPED_LARGE + 1))
+    echo "$TRANSCRIPT_PATH" >> "$STATE_FILE"; continue
+  fi
+
+  SESSION_ID=$(basename "$TRANSCRIPT_PATH" .jsonl)
+
+  REDACTED=$(mktemp); PAYLOAD=$(mktemp)
+  if ! "$SCRIPT_DIR/redact-pii" < "$TRANSCRIPT_PATH" > "$REDACTED"; then
+    rm -f "$REDACTED" "$PAYLOAD"
+    log "[$COUNT/$TOTAL] redact failed: $TRANSCRIPT_PATH"
+    FAILED=$((FAILED + 1)); continue
+  fi
+
+  LINE_COUNT=$(wc -l < "$REDACTED" | tr -d ' ')
+  MESSAGE_COUNT=$(grep -c '"type":"user"\|"type":"assistant"' "$REDACTED" 2>/dev/null || true)
+  TOOL_COUNT=$(grep -c '"type":"tool_use"\|"tool_name"' "$REDACTED" 2>/dev/null || true)
+  ERROR_COUNT=$(grep -c '"type":"system","subtype":"error"\|PostToolUseFailure\|"error"' "$REDACTED" 2>/dev/null || true)
+
+  if ! jq -n --arg sid "$SESSION_ID" --arg uid "$USER_ID" \
+      --argjson lc "$LINE_COUNT" --argjson mc "$MESSAGE_COUNT" \
+      --argjson tc "$TOOL_COUNT" --argjson ec "$ERROR_COUNT" \
+      --rawfile transcript "$REDACTED" \
+      '{session_id: $sid, user_id: $uid, transcript: $transcript,
+        platform: "codex", backfilled: true,
+        line_count: $lc, message_count: $mc, tool_count: $tc, error_count: $ec}' > "$PAYLOAD"; then
+    rm -f "$REDACTED" "$PAYLOAD"
+    log "[$COUNT/$TOTAL] payload build failed: $TRANSCRIPT_PATH"
+    FAILED=$((FAILED + 1)); continue
+  fi
+
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "${ENDPOINT}/rest/v1/session_logs?on_conflict=session_id" \
+    -H "apikey: $API_KEY" \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "Content-Type: application/json" \
+    -H "Prefer: resolution=ignore-duplicates,return=minimal" \
+    -d @"$PAYLOAD") || true
+
+  rm -f "$REDACTED" "$PAYLOAD"
+
+  if [ "$STATUS" = "201" ] || [ "$STATUS" = "200" ] || [ "$STATUS" = "204" ]; then
+    UPLOADED=$((UPLOADED + 1))
+    echo "$TRANSCRIPT_PATH" >> "$STATE_FILE"
+    log "[$COUNT/$TOTAL] uploaded: $SESSION_ID (${LINE_COUNT} lines)"
+  else
+    FAILED=$((FAILED + 1))
+    log "[$COUNT/$TOTAL] upload failed (status=$STATUS): $SESSION_ID"
+  fi
+
+  sleep 1
+done < "$FILES_LIST"
+
+log "Backfill complete. Uploaded=$UPLOADED already-done=$SKIPPED_DONE empty=$SKIPPED_EMPTY too-large=$SKIPPED_LARGE failed=$FAILED total=$TOTAL"
